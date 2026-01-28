@@ -117,10 +117,10 @@ def add_standard_additional_parameters(phi, params, identif_config, model):
     for param_def in additional_params:
         for link_idx, jname in enumerate(model.names[1:]):  # Skip world link
             param_name = f"{param_def['name']}_{jname}"
-            params.append(param_name)
 
             # Get parameter value
             if identif_config.get(param_def['enabled_key'], False):
+                params.append(param_name)
                 try:
                     values_list = identif_config.get(
                         param_def['values_key'], []
@@ -219,112 +219,86 @@ def add_custom_parameters(phi, params, custom_params, model):
 def get_standard_parameters(
     model, identif_config=None, include_additional=True, custom_params=None
 ):
-    """Get standard inertial parameters from robot model with extensible
-    parameter support.
-
-    Args:
-        model: Robot model (Pinocchio model)
-        identif_config (dict, optional): Dictionary of parameter settings for
-            additional parameters. Expected keys:
-            - has_actuator_inertia (bool): Include actuator inertia parameters
-            - has_friction (bool): Include friction parameters
-            - has_joint_offset (bool): Include joint offset parameters
-            - Ia (list): Actuator inertia values
-            - fv (list): Viscous friction coefficients
-            - fs (list): Static friction coefficients
-            - off (list): Joint offset values
-        include_additional (bool): Whether to include additional parameters
-            beyond inertial
-        custom_params (dict, optional): Custom parameter definitions
-            Format: {param_name: {values: list, per_joint: bool,
-            default: float}}
-
-    Returns:
-        dict: Parameter names mapped to their values
-
-    Examples:
-        # Basic usage - only inertial parameters
-        params = get_standard_parameters(robot.model)
-
-        # Include standard additional parameters
-        identif_config = {
-            'has_actuator_inertia': True,
-            'has_friction': True,
-            'Ia': [0.1, 0.2, 0.3],
-            'fv': [0.01, 0.02, 0.03],
-            'fs': [0.001, 0.002, 0.003]
-        }
-        params = get_standard_parameters(robot.model, identif_config)
-
-        # Add custom parameters
-        custom = {
-            'gear_ratio': {'values': [100, 50, 25], 'per_joint': True,
-                          'default': 1.0},
-            'temperature': {'values': [20.0], 'per_joint': False,
-                           'default': 25.0}
-        }
-        params = get_standard_parameters(robot.model, identif_config,
-                                        custom_params=custom)
+    """
+    Get standard inertial parameters aligned PERFECTLY with the Regressor 
+    column structure (Joint-Interleaved), using explicit joint names.
     """
     if identif_config is None:
         identif_config = {}
-
     if custom_params is None:
         custom_params = {}
 
     phi = []
     params = []
 
-    # Standard inertial parameter names in desired order
-    # inertial_params = [
-    #     "Ixx", "Ixy", "Ixz", "Iyy", "Iyz", "Izz",
-    #     "mx", "my", "mz", "m"
-    # ]
-    inertial_params = [
-        "m",
-        "mx",
-        "my",
-        "mz",
-        "Ixx",
-        "Ixy",
-        "Iyy",
-        "Ixz",
-        "Iyz",
-        "Izz",
+    inertial_params_names = [
+        "m", "mx", "my", "mz", "Ixx", "Ixy", "Iyy", "Ixz", "Iyz", "Izz",
     ]
 
-    # Extract and rearrange inertial parameters for each link
-    assert (
-        len(model.inertias) == model.njoints
-    ), "Inertia count mismatch with joints"
-    for link_idx, jname in enumerate(model.names[1:]):
-        # Get dynamic parameters from Pinocchio (in Pinocchio order)
-        # Returns the representation of the matrix as a vector of dynamic
-        # parameters. The parameters are given as 𝑣=[𝑚,𝑚𝑐𝑥,𝑚𝑐𝑦,𝑚𝑐𝑧,
-        # 𝐼𝑥𝑥,𝐼𝑥𝑦,𝐼𝑦𝑦,𝐼𝑥𝑧,𝐼𝑦𝑧,𝐼𝑧𝑧]^𝑇 where 𝑐 is the center
-        # of mass, 𝐼=𝐼𝐶+𝑚𝑆𝑇(𝑐)𝑆(𝑐) and 𝐼𝐶 has its origin at the
-        # barycenter and 𝑆(𝑐) is the the skew matrix representation of the
-        # cross product operator from Vector of spatial inertias supported by
-        # each joint.
-        pinocchio_params = model.inertias[link_idx].toDynamicParameters()
+    has_friction = identif_config.get('has_friction', False)
+    has_actuator_inertia = identif_config.get('has_actuator_inertia', False)
+    has_joint_offset = identif_config.get('has_joint_offset', False)
+    
+    # 1. Retrieve the list of active joints from config
+    #    Make sure this list MATCHES the order of columns in your regressor!
+    active_joints = identif_config.get("active_joints", [])
+    
+    # Fallback if config is missing (safety)
+    if not active_joints:
+        print("[Warning] 'active_joints' not found in config. Falling back to all model joints.")
+        active_joints = list(model.names[1:])
 
-        # Rearrange from Pinocchio order [m, mx, my, mz, Ixx, Ixy, Iyy, Ixz,
-        # Iyz, Izz] to desired order [Ixx, Ixy, Ixz, Iyy, Iyz, Izz, mx, my,
-        # mz, m]
-        # reordered_params = reorder_inertial_parameters(pinocchio_params)
-        reordered_params = pinocchio_params
-        # Add parameter names and values
-        for param_name in inertial_params:
+    # 2. Iterate strictly over the user-defined active joints
+    for i, jname in enumerate(active_joints):
+        
+        # --- KEY FIX: Use Pinocchio to resolve the ID ---
+        if not model.existJointName(jname):
+            raise ValueError(f"Joint '{jname}' found in config but does not exist in Pinocchio model!")
+            
+        joint_id = model.getJointId(jname)
+        
+        # --- A. INERTIAL PARAMETERS (10) ---
+        # Note: Pinocchio stores inertia in model.inertias[joint_id]
+        pinocchio_params = model.inertias[joint_id].toDynamicParameters()
+
+        for param_name in inertial_params_names:
             params.append(f"{param_name}_{jname}")
-        phi.extend(reordered_params)
+        phi.extend(pinocchio_params)
 
-    # Add additional standard parameters if requested
-    if include_additional:
-        phi, params = add_standard_additional_parameters(
-            phi, params, identif_config, model
-        )
+        if include_additional:
+            # Note: For friction/offset lists, we assume they are ordered 
+            # consistently with 'active_joints'.
+            # It's safer to rely on 'i' (loop index) for these lists 
+            # if they were built corresponding to active_joints.
+            
+            # 1. Friction (fv, fs)
+            if has_friction:
+                fv_list = identif_config.get('fv', [])
+                fs_list = identif_config.get('fs', [])
+                fv_val = fv_list[i] if len(fv_list) > i else 0.0
+                fs_val = fs_list[i] if len(fs_list) > i else 0.0
+                
+                params.append(f"fv_{jname}")
+                phi.append(fv_val)
+                params.append(f"fs_{jname}")
+                phi.append(fs_val)
 
-    # Add custom parameters if provided
+            # 2. Actuator Inertia (ia)
+            if has_actuator_inertia:
+                ia_list = identif_config.get('Ia', [])
+                ia_val = ia_list[i] if len(ia_list) > i else 0.0
+                
+                params.append(f"ia_{jname}")
+                phi.append(ia_val)
+
+            # 3. Joint Offset (off)
+            if has_joint_offset:
+                off_list = identif_config.get('off', [])
+                off_val = off_list[i] if len(off_list) > i else 0.0
+                
+                params.append(f"off_{jname}")
+                phi.append(off_val)
+
     if custom_params:
         phi, params = add_custom_parameters(phi, params, custom_params, model)
 
