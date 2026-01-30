@@ -624,13 +624,14 @@ def solve_LMI_OLS(
     return phi.value
 
 def solve_differential_LMI_OLS(
-    W_A, Y_A_meas, Y_A_armature, 
-    W_B, Y_B_meas, Y_B_armature,
+    W_A, Y_A_meas, 
+    W_B, Y_B_meas,
     mass_load_known,   # Scalar (kg)
     load_joint_idx,    # Index of the joint carrying the load (0-based)
     nb_joints,
     joint_names,       # List of strings ['shoulder_pitch', ...]
     phi_cad_dict,      # Dictionary of CAD values
+    armature_vals,
     lambda_r=0.1,      # Regularization weight for Robot
     lambda_l=0.1,
 ):
@@ -640,15 +641,8 @@ def solve_differential_LMI_OLS(
     nSamples_A = Y_A_meas.shape[0]
     nSamples_B = Y_B_meas.shape[0]
     
-    tau_arm_A_flat = Y_A_armature.flatten(order='F')
-    tau_arm_B_flat = Y_B_armature.flatten(order='F')
-    
     # --- 2. Extract Payload Regressor from W_B ---
-    # The payload moves exactly like the link it is attached to.
-    # We grab the inertial columns (0-9) for the specified joint index.
-    # Assuming 13 params per joint: [m, h(3), I(6), Fv, Fs, Off]
-    
-    start_col = (load_joint_idx-1) * 13
+    start_col = (load_joint_idx-1) * 14
     
     # Column 0 is Mass (scaling factor for known mass)
     W_load_mass = W_B[:, start_col + 0]  
@@ -681,16 +675,16 @@ def solve_differential_LMI_OLS(
     Block_Scale   = np.vstack([-K_A, -K_B])
     
     RHS = np.concatenate([
-        -tau_arm_A_flat,                       
-        -tau_payload_mass - tau_arm_B_flat
+        np.zeros(len(Y_A_flat)),                       
+        -tau_payload_mass
     ])
     
     # --- 5. Build Priors from Dictionary ---
-    phi_r_prior = np.zeros(13 * nb_joints)
-    reg_mask    = np.zeros(13 * nb_joints)
+    phi_r_prior = np.zeros(14 * nb_joints)
+    reg_mask    = np.zeros(14 * nb_joints)
     
     for i, jname in enumerate(joint_names):
-        base = i * 13
+        base = i * 14
         # Fill standard params if they exist in dict, else 0.0
         phi_r_prior[base+0] = phi_cad_dict.get(f"m_{jname}", 0.0)
         phi_r_prior[base+1] = phi_cad_dict.get(f"mx_{jname}", 0.0)
@@ -702,9 +696,12 @@ def solve_differential_LMI_OLS(
         phi_r_prior[base+7] = phi_cad_dict.get(f"Ixz_{jname}", 0.0)
         phi_r_prior[base+8] = phi_cad_dict.get(f"Iyz_{jname}", 0.0)
         phi_r_prior[base+9] = phi_cad_dict.get(f"Izz_{jname}", 0.0)
+        phi_r_prior[base+12] = armature_vals[i]
         
-        reg_mask[base : base+10] = 1.0 
-        reg_mask[base+10 : base+13] = 0.0
+        reg_mask[base : base+10] = 1.0  # inertial params
+        reg_mask[base+10 : base+12] = 0.0  # joint frictions
+        reg_mask[base+12 : base+13] = 1.0  # armature
+        reg_mask[base+13 : base+14] = 0.0  # offset
     
         r_in  = 0.03/2
         r_out = 0.126/2
@@ -733,7 +730,7 @@ def solve_differential_LMI_OLS(
             ])
         
     # --- 6. Optimization Variables ---
-    phi_robot = cp.Variable(13 * nb_joints)
+    phi_robot = cp.Variable(14 * nb_joints)
     phi_load  = cp.Variable(9) # [mx, my, mz, Ixx...Izz]
     k_tau     = cp.Variable(nb_joints)
 
@@ -742,7 +739,7 @@ def solve_differential_LMI_OLS(
     
     # A. Robot LMI
     for j in range(nb_joints):
-        base = j * 13
+        base = j * 14
         m, h = phi_robot[base], phi_robot[base+1:base+4]
         I_t = cp.bmat([[phi_robot[base+4], phi_robot[base+5], phi_robot[base+7]],
                        [phi_robot[base+5], phi_robot[base+6], phi_robot[base+8]],
@@ -753,6 +750,9 @@ def solve_differential_LMI_OLS(
         # Friction Positive
         constraints.append(phi_robot[base+10] >= 0)
         constraints.append(phi_robot[base+11] >= 0)
+        
+        # Armature positive
+        constraints.append(phi_robot[base+12] >= 0)
 
     # B. Payload LMI (Fixed Mass)
     h_L = phi_load[0:3]
@@ -806,4 +806,4 @@ def solve_differential_LMI_OLS(
     print(f"{'TOTAL OPTIMIZED COST':<30} | {total_val:.6e}")
     print("-" * 60)
 
-    return phi_robot.value, phi_load.value, k_tau.value, tau_load_B
+    return phi_robot.value, phi_load.value, k_tau.value, tau_load_B, (term_fit, term_robot, term_load)
