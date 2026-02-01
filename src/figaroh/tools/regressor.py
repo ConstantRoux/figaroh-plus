@@ -624,15 +624,15 @@ def solve_LMI_OLS(
     return phi.value
 
 def solve_differential_LMI_OLS(
-    W_A, Y_A_meas, 
-    W_B, Y_B_meas,
-    mass_load_known,   # Scalar (kg)
-    load_joint_idx,    # Index of the joint carrying the load (0-based)
+    W_A, Y_A_meas, mass_load_A, 
+    W_B, Y_B_meas, mass_load_B,
+    load_joint_idx,   
     nb_joints,
-    joint_names,       # List of strings ['shoulder_pitch', ...]
-    phi_cad_dict,      # Dictionary of CAD values
+    joint_names,       
+    phi_cad_dict,   
     armature_vals,
-    lambda_r=0.1,      # Regularization weight for Robot
+    mesh_bounds,
+    lambda_r=0.1, 
     lambda_l=0.1,
 ):
     # --- 1. Data Prep ---
@@ -641,17 +641,21 @@ def solve_differential_LMI_OLS(
     nSamples_A = Y_A_meas.shape[0]
     nSamples_B = Y_B_meas.shape[0]
     
-    # --- 2. Extract Payload Regressor from W_B ---
-    start_col = (load_joint_idx-1) * 14
+    # --- 2. Extract Payload Regressors ---
+    start_col = (load_joint_idx-1) * 14 
     
-    # Column 0 is Mass (scaling factor for known mass)
-    W_load_mass = W_B[:, start_col + 0]  
+    # Extract Mass Columns (Scaling factor for known mass)
+    W_load_mass_A = W_A[:, start_col + 0]  
+    W_load_mass_B = W_B[:, start_col + 0]
     
-    # Columns 1-9 are Geometry (h_x ... I_zz)
-    W_load_geom = W_B[:, start_col + 1 : start_col + 10] 
+    # Extract Geometry Columns (Shape to identify: hx...Izz)
+    # Columns 1 to 10 correspond to h(3) + I(6)
+    W_load_geom_A = W_A[:, start_col + 1 : start_col + 10] 
+    W_load_geom_B = W_B[:, start_col + 1 : start_col + 10] 
     
-    # Precompute Force Vector from Known Mass (RHS term)
-    tau_payload_mass = W_load_mass * mass_load_known
+    # Pre-calculate known mass torque to move to RHS
+    tau_payload_mass_A = W_load_mass_A * mass_load_A
+    tau_payload_mass_B = W_load_mass_B * mass_load_B
 
     # --- 3. Build Scale Regressor (Diagonal Matrices) ---
     def build_scale_matrix(Y_flat, n_samples, n_joints):
@@ -664,28 +668,44 @@ def solve_differential_LMI_OLS(
     K_A = build_scale_matrix(Y_A_flat, nSamples_A, nb_joints)
     K_B = build_scale_matrix(Y_B_flat, nSamples_B, nb_joints)
 
-    # --- 4. Stack Linear System ---
-    # System: [Robot | Payload_Geom | Scales] * X = RHS
+    # --- 4. Stack Linear System (Block Diagonal for Payloads) ---
     
-    # Top (Exp A): W_A * phi_r  +  0            - K_A * k = 0
-    # Bot (Exp B): W_B * phi_r  +  W_geom * phi_l - K_B * k = -tau_mass
+    # System Structure:
+    # [ -Robot_A | -Geom_A |   0    | Scale_A ] * [phi_r]
+    # [ -Robot_B |   0    | -Geom_B | Scale_B ]   [phi_l_A]
+    #                                            [phi_l_B]
+    #                                            [k]
     
-    Block_Robot   = np.vstack([W_A, W_B])
-    Block_Payload = np.vstack([np.zeros((len(Y_A_flat), 9)), W_load_geom])
-    Block_Scale   = np.vstack([-K_A, -K_B])
+    # 1. Robot Block (Shared)
+    Block_Robot = np.vstack([-W_A, -W_B])
     
+    # 2. Payload Block (Block Diagonal)
+    # Zeros must match the dimensions of the other experiment's regressor
+    Zero_A = np.zeros(W_load_geom_A.shape)
+    Zero_B = np.zeros(W_load_geom_B.shape)
+    
+    # Row A: [Geom_A, 0]
+    # Row B: [0, Geom_B]
+    Row_A = np.hstack([-W_load_geom_A, Zero_A]) 
+    Row_B = np.hstack([Zero_B, -W_load_geom_B]) 
+    Block_Payload = np.vstack([Row_A, Row_B])
+    
+    # 3. Scale Block
+    Block_Scale = np.vstack([K_A, K_B])
+    
+    # 4. RHS
     RHS = np.concatenate([
-        np.zeros(len(Y_A_flat)),                       
-        -tau_payload_mass
+        tau_payload_mass_A,                       
+        tau_payload_mass_B
     ])
     
-    # --- 5. Build Priors from Dictionary ---
+    # --- 5. Build Priors & Masks ---
     phi_r_prior = np.zeros(14 * nb_joints)
     reg_mask    = np.zeros(14 * nb_joints)
     
     for i, jname in enumerate(joint_names):
         base = i * 14
-        # Fill standard params if they exist in dict, else 0.0
+        # Inertial Params
         phi_r_prior[base+0] = phi_cad_dict.get(f"m_{jname}", 0.0)
         phi_r_prior[base+1] = phi_cad_dict.get(f"mx_{jname}", 0.0)
         phi_r_prior[base+2] = phi_cad_dict.get(f"my_{jname}", 0.0)
@@ -696,114 +716,145 @@ def solve_differential_LMI_OLS(
         phi_r_prior[base+7] = phi_cad_dict.get(f"Ixz_{jname}", 0.0)
         phi_r_prior[base+8] = phi_cad_dict.get(f"Iyz_{jname}", 0.0)
         phi_r_prior[base+9] = phi_cad_dict.get(f"Izz_{jname}", 0.0)
+        
+        # Armature Prior (Index 12)
         phi_r_prior[base+12] = armature_vals[i]
         
-        reg_mask[base : base+10] = 1.0  # inertial params
-        reg_mask[base+10 : base+12] = 0.0  # joint frictions
-        reg_mask[base+12 : base+13] = 1.0  # armature
-        reg_mask[base+13 : base+14] = 0.0  # offset
+        # Mask Definition
+        reg_mask[base+4 : base+10]    = 1.0  # Regularize Inertial
+        reg_mask[base+10 : base+12] = 0.0  # Free Friction (Fv, Fs)
+        reg_mask[base+12 : base+13] = 1.0  # Regularize Armature
+        reg_mask[base+13 : base+14] = 0.0  # Free Offset
     
-        r_in  = 0.03/2
-        r_out = 0.126/2
-        h_th  = 0.015
-        # p_com = np.array([0.228 + 0.0775, 0.0, 0.0])
-        p_com = np.array([0.0775, 0.0, 0.0])
-        
-        val_Ix = 0.5 * mass_load_known * (r_in**2 + r_out**2)
-        val_Iy_Iz = (1.0/12.0) * mass_load_known * (3*(r_in**2 + r_out**2) + h_th**2)    
+    # Helper for Load Prior
+    def build_load_prior(mass, p_com, r_in, r_out, h_th):
+        val_Ix = 0.5 * mass * (r_in**2 + r_out**2)
+        val_Iy_Iz = (1.0/12.0) * mass * (3*(r_in**2 + r_out**2) + h_th**2)    
         I_load_at_com = np.diag([val_Ix, val_Iy_Iz, val_Iy_Iz])
         p_norm_sq = np.dot(p_com, p_com)
         p_outer   = np.outer(p_com, p_com)
-        I_load_at_origin = I_load_at_com + mass_load_known * (p_norm_sq * np.eye(3) - p_outer)
-        h_load = mass_load_known * p_com
+        I_load_at_origin = I_load_at_com + mass * (p_norm_sq * np.eye(3) - p_outer)
+        h_load = mass * p_com
 
-        phi_l_prior = np.array([
-                h_load[0], 
-                h_load[1], 
-                h_load[2],
-                I_load_at_origin[0,0], # Ixx
-                I_load_at_origin[0,1], # Ixy
-                I_load_at_origin[1,1], # Iyy
-                I_load_at_origin[0,2], # Ixz
-                I_load_at_origin[1,2], # Iyz
-                I_load_at_origin[2,2]  # Izz
+        return np.array([
+                h_load[0], h_load[1], h_load[2],
+                I_load_at_origin[0,0], I_load_at_origin[0,1], I_load_at_origin[1,1], 
+                I_load_at_origin[0,2], I_load_at_origin[1,2], I_load_at_origin[2,2]
             ])
+    
+    # Define Load Priors
+    p_com_A = np.array([0.0775, 0.0, 0.0])
+    phi_l_prior_A = build_load_prior(mass_load_A, p_com_A, 0.025/2, 0.129/2, 0.0155/2)
+    
+    p_com_B = np.array([0.0775, 0.0, 0.0])
+    phi_l_prior_B = build_load_prior(mass_load_B, p_com_B, 0.029/2, 0.160/2, 0.023/2)
         
     # --- 6. Optimization Variables ---
-    phi_robot = cp.Variable(14 * nb_joints)
-    phi_load  = cp.Variable(9) # [mx, my, mz, Ixx...Izz]
-    k_tau     = cp.Variable(nb_joints)
+    phi_robot  = cp.Variable(14 * nb_joints)
+    phi_load_A = cp.Variable(9) 
+    phi_load_B = cp.Variable(9)
+    k_tau      = cp.Variable(nb_joints)
 
     # --- 7. Constraints ---
     constraints = []
     
     # A. Robot LMI
-    for j in range(nb_joints):
+    for j, jname in enumerate(joint_names):
         base = j * 14
         m, h = phi_robot[base], phi_robot[base+1:base+4]
         I_t = cp.bmat([[phi_robot[base+4], phi_robot[base+5], phi_robot[base+7]],
                        [phi_robot[base+5], phi_robot[base+6], phi_robot[base+8]],
                        [phi_robot[base+7], phi_robot[base+8], phi_robot[base+9]]])
-        # LMI Condition
+        
+        # Physical Consistency (Mass/Inertia)
         constraints.append(cp.bmat([[0.5*cp.trace(I_t)*np.eye(3)-I_t, cp.reshape(h,(3,1))],
                                     [cp.reshape(h,(1,3)), cp.reshape(m,(1,1))]]) >> 0)
-        # Friction Positive
+        # Positive Friction
         constraints.append(phi_robot[base+10] >= 0)
         constraints.append(phi_robot[base+11] >= 0)
-        
-        # Armature positive
+        # Positive Armature
         constraints.append(phi_robot[base+12] >= 0)
+        # Mesh bounds
+        b_min, b_max = mesh_bounds[jname]
+        constraints += [
+            h[0] >= m * b_min[0], h[0] <= m * b_max[0],
+            h[1] >= m * b_min[1], h[1] <= m * b_max[1],
+            h[2] >= m * b_min[2], h[2] <= m * b_max[2]
+        ]
 
-    # B. Payload LMI (Fixed Mass)
-    h_L = phi_load[0:3]
-    Ixx, Ixy, Iyy, Ixz, Iyz, Izz = phi_load[3], phi_load[4], phi_load[5], phi_load[6], phi_load[7], phi_load[8]
-    I_L = cp.bmat([[Ixx, Ixy, Ixz], [Ixy, Iyy, Iyz], [Ixz, Iyz, Izz]])
+    # B. Payload A LMI
+    h_A = phi_load_A[0:3]
+    I_A = cp.bmat([[phi_load_A[3], phi_load_A[4], phi_load_A[6]],
+                   [phi_load_A[4], phi_load_A[5], phi_load_A[7]],
+                   [phi_load_A[6], phi_load_A[7], phi_load_A[8]]])
+    m_A_const = np.array([[mass_load_A]])
+    constraints.append(cp.bmat([[0.5*cp.trace(I_A)*np.eye(3)-I_A, cp.reshape(h_A,(3,1))],
+                                [cp.reshape(h_A,(1,3)), m_A_const]]) >> 0)
     
-    # Inject KNOWN MASS constant into LMI
-    m_L_const = np.array([[mass_load_known]])
-    constraints.append(cp.bmat([[0.5*cp.trace(I_L)*np.eye(3)-I_L, cp.reshape(h_L,(3,1))],
-                                [cp.reshape(h_L,(1,3)), m_L_const]]) >> 0)
+    # C. Payload B LMI
+    h_B = phi_load_B[0:3]
+    I_B = cp.bmat([[phi_load_B[3], phi_load_B[4], phi_load_B[6]],
+                   [phi_load_B[4], phi_load_B[5], phi_load_B[7]],
+                   [phi_load_B[6], phi_load_B[7], phi_load_B[8]]])
+    m_B_const = np.array([[mass_load_B]])
+    constraints.append(cp.bmat([[0.5*cp.trace(I_B)*np.eye(3)-I_B, cp.reshape(h_B,(3,1))],
+                                [cp.reshape(h_B,(1,3)), m_B_const]]) >> 0)
 
-    # C. Scale Bounds
+    # D. Scale Bounds
     constraints.append(k_tau >= 0.0)
 
     # --- 8. Cost & Solve ---
-    pred_y = Block_Robot @ phi_robot + Block_Payload @ phi_load + Block_Scale @ k_tau
+    term_robot   = Block_Robot @ phi_robot
+    term_payload = Block_Payload @ cp.hstack([phi_load_A, phi_load_B])
+    term_scale   = Block_Scale @ k_tau
+    
+    pred_y = term_robot + term_payload + term_scale
+    
     N_total = len(RHS)
     
+    # Regularization Terms
     diff_robot = phi_robot - phi_r_prior
     weighted_diff_robot = cp.multiply(reg_mask, diff_robot)
     
-    # Payload regularization is usually weak (allow shape to adapt)    
     cost = (1.0/N_total) * cp.sum_squares(pred_y - RHS) + \
            lambda_r * cp.sum_squares(weighted_diff_robot) + \
-           lambda_l * cp.sum_squares(phi_load - phi_l_prior)
+           lambda_l * cp.sum_squares(phi_load_A - phi_l_prior_A) + \
+           lambda_l * cp.sum_squares(phi_load_B - phi_l_prior_B)
 
-    print(f"[SDP] Solving Calib: Robot + Scale + Payload (Mass={mass_load_known}kg)...")
+    print(f"[SDP] Solving Dual Load ID (Mass A={mass_load_A}, Mass B={mass_load_B})...")
     prob = cp.Problem(cp.Minimize(cost), constraints)
-    prob.solve(solver=cp.CLARABEL, verbose=True)
+    prob.solve(solver=cp.CLARABEL, verbose=True, tol_gap_abs=1e-5, tol_gap_rel=1e-5, max_iter=2000)
     
-    phi_load_val = phi_load.value
-    tau_geom = W_load_geom @ phi_load_val
-    tau_mass = W_load_mass * mass_load_known
-    tau_load_B = tau_geom + tau_mass
-    
-    # --- Retrieve Values ---
+    # --- 9. Retrieve Values & Costs ---
     phi_robot_val = phi_robot.value
-    phi_load_val  = phi_load.value
     k_tau_val     = k_tau.value
-    term_fit   = (1.0/N_total) * cp.sum_squares(pred_y - RHS).value
-    term_robot = lambda_r * cp.sum_squares(phi_robot - phi_r_prior).value
-    term_load  = lambda_l * cp.sum_squares(phi_load - phi_l_prior).value
-    total_val = term_fit + term_robot + term_load
+    phi_load_A_val = phi_load_A.value
+    phi_load_B_val = phi_load_B.value
+    
+    # Calculate Reconstruction Torques    
+    # Payloads
+    tau_load_A = (W_load_geom_A @ phi_load_A_val) + (W_load_mass_A * mass_load_A)
+    tau_load_B = (W_load_geom_B @ phi_load_B_val) + (W_load_mass_B * mass_load_B)
+
+    # Breakdown Costs
+    term_fit_val   = (1.0/N_total) * cp.sum_squares(pred_y - RHS).value
+    term_robot_val = lambda_r * cp.sum_squares(weighted_diff_robot).value
+    term_load_val  = lambda_l * (cp.sum_squares(phi_load_A - phi_l_prior_A).value + \
+                                 cp.sum_squares(phi_load_B - phi_l_prior_B).value)
+    
+    total_val = term_fit_val + term_robot_val + term_load_val
+
     print("-" * 60)
     print(f"{'COST TERM BREAKDOWN':<30} | {'VALUE':<15}")
     print("-" * 60)
-    print(f"{'1. Data Fit (MSE)':<30} | {term_fit:.6e}")
-    print(f"{'2. Robot Reg (CAD)':<30} | {term_robot:.6e}")
-    print(f"{'3. Payload Reg (Prior)':<30} | {term_load:.6e}")
+    print(f"{'1. Data Fit (MSE)':<30} | {term_fit_val:.6e}")
+    print(f"{'2. Robot Reg':<30} | {term_robot_val:.6e}")
+    print(f"{'3. Payload Reg':<30} | {term_load_val:.6e}")
     print("-" * 60)
     print(f"{'TOTAL OPTIMIZED COST':<30} | {total_val:.6e}")
     print("-" * 60)
 
-    return phi_robot.value, phi_load.value, k_tau.value, tau_load_B, (term_fit, term_robot, term_load)
+    # Return tuple of results
+    return (phi_robot_val, phi_load_A_val, phi_load_B_val, k_tau_val, 
+           (tau_load_A, tau_load_B),
+           (term_fit_val, term_robot_val, term_load_val))
